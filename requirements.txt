@@ -1,0 +1,6 @@
+openai
+anthropic
+ddgs
+flask
+requests
+beautifulsoup4

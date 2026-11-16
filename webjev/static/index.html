@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WebJev</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #fff; color: #000;
+         font: 19px/1.45 "Times New Roman", Times, serif; }
+  main { max-width: 1100px; margin: 0 auto; padding: 32px 24px 80px; }
+  main:not(:has(.col + .col)) { max-width: 760px; }
+  h1 { font-size: 42px; font-weight: normal; margin: 0; line-height: 1.1; }
+  .sub { margin: 4px 0 28px; }
+  .banner { font-style: italic; margin-bottom: 20px; }
+  form { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start; }
+  textarea, input[type=text], select, button {
+    font: inherit; color: #000; background: #fff; border: 1px solid #000; border-radius: 0; padding: 6px 9px; }
+  textarea { flex: 1 1 100%; min-height: 46px; resize: vertical; }
+  button { cursor: pointer; }
+  button:disabled { color: #777; border-color: #777; cursor: default; }
+  .cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 40px; margin-top: 32px; }
+  .col h2 { font-size: 26px; font-weight: normal; margin: 0; padding-bottom: 6px; border-bottom: 1px solid #000; }
+  .col .status { font-style: italic; margin: 8px 0 4px; }
+  .card { margin: 18px 0 0; overflow-wrap: anywhere; }
+  .card.indent { margin-left: 24px; }
+  .head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap;
+          padding-bottom: 3px; border-bottom: 1px solid #000; }
+  .head .meta:first-child { font-size: 21px; color: #000; }
+  .badge { font-size: 21px; font-weight: bold; }
+  .bad { color: #a00000; }
+  .meta { color: #555; font-size: 16px; }
+  .label { font-style: italic; margin-top: 8px; }
+  .label.answer { font-style: normal; font-size: 26px; padding-bottom: 6px; margin: 14px 0 12px;
+                  border-bottom: 1px solid #000; }
+  .why { margin: 2px 0 0; }
+  .bars { margin-top: 8px; display: grid; grid-template-columns: auto 1fr auto; gap: 2px 10px;
+          align-items: center; font-size: 16px; max-width: 420px; }
+  .bar { height: 1px; background: #bbb; overflow: visible; }
+  .bar i { display: block; height: 5px; margin-top: -2px; background: #000; }
+  .pre { white-space: pre-wrap; }
+  ul { margin: 4px 0 0; padding-left: 24px; }
+  a { color: #0000ee; } a:visited { color: #551a8b; }
+  details summary { cursor: pointer; }
+  ul.plain { list-style: none; padding-left: 4px; }
+  ul.plain li { margin: 2px 0; }
+  .more { margin: 2px 0 6px 18px; }
+  .row { display: flex; gap: 8px; margin-top: 8px; }
+  .row input { flex: 1; }
+  table { border-collapse: collapse; margin-top: 6px; font-size: 17px; }
+  td { padding: 1px 20px 1px 0; } td.meta { color: #000; font-size: 17px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>WebJev</h1>
+  <div class="sub">A web research agent.</div>
+  <div id="banner" class="banner" hidden></div>
+  <form id="form">
+    <textarea id="question" placeholder="Ask a research question…" required></textarea>
+    <select id="mode" aria-label="Mode">
+      <option value="jev">Jev decides</option>
+      <option value="baseline">Baseline (LLM decides)</option>
+      <option value="both">Both, side by side</option>
+    </select>
+    <button id="go">Run</button>
+  </form>
+  <div id="cols" class="cols"></div>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const TITLES = { jev: "Jev decides", baseline: "Baseline: LLM decides" };
+const METRICS = [
+  ["searches", "Web searches"], ["pages_visited", "Pages visited"],
+  ["search_answer_cycles", "SEARCH → ANSWER cycles"], ["clarification_requests", "Clarification requests"],
+  ["time_to_answer_s", "Time to final answer (s)"], ["agent_time_s", "…excluding waiting on you (s)"],
+  ["decision_time_s", "Time spent deciding (s)"], ["llm_calls", "LLM calls"], ["jev_calls", "Jev calls"],
+];
+let active = 0;
+
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text !== undefined && text !== null) node.textContent = text;
+  return node;
+}
+function link(url, text) {
+  const a = el("a", "", text || url);
+  if (/^https?:\/\//i.test(url)) { a.href = url; a.target = "_blank"; a.rel = "noopener noreferrer"; }
+  return a;
+}
+function compactSourceList(sources) {
+  // One line per source; the snippet note and summary open on click.
+  const ul = el("ul", "plain");
+  for (const s of sources) {
+    const li = el("li"), details = el("details"), summary = el("summary");
+    summary.append(`[${s.id}] `, s.title || s.url);
+    details.append(summary);
+    const body = el("div", "more");
+    body.append(link(s.url));
+    if (!s.fetched) body.append(el("div", "meta", "Snippet only (page could not be read)"));
+    if (s.summary) body.append(el("div", "meta", (s.relevant ? "" : "Not relevant. ") + s.summary));
+    details.append(body);
+    li.append(details);
+    ul.append(li);
+  }
+  return ul;
+}
+
+const render = {
+  decision(e) {
+    const card = el("div", "card");
+    const head = el("div", "head");
+    head.append(el("span", "meta", `Step ${e.step}`), el("span", `badge ${e.action}`, e.action.toUpperCase()),
+                el("span", "meta", `confidence ${e.confidence.toFixed(2)}, decided in ${e.latency_s}s by ${e.decider}`));
+    card.append(head, el("p", "why", e.why));
+    if (e.override) card.append(el("p", "why label",`Overridden (was ${e.chosen.toUpperCase()}): ${e.override}`));
+    const probs = e.details && e.details.probabilities;
+    if (probs) {
+      const bars = el("div", "bars");
+      for (const [name, p] of Object.entries(probs).sort((a, b) => b[1] - a[1])) {
+        const bar = el("div", `bar ${name}`), fill = el("i");
+        fill.style.width = `${Math.round(p * 100)}%`;
+        bar.append(fill);
+        bars.append(el("span", "", name), bar, el("span", "meta", `${Math.round(p * 100)}%`));
+      }
+      card.append(bars);
+    }
+    return card;
+  },
+  search(e) {
+    const card = el("div", "card indent");
+    card.append(el("div", "label", "Searched"), el("div", "", e.query));
+    if (e.sources.length) card.append(compactSourceList(e.sources));
+    if (e.gaps.length) {
+      const gaps = el("details");
+      gaps.append(el("summary", "meta", `Still unknown (${e.gaps.length})`));
+      const ul = el("ul"); e.gaps.forEach((g) => ul.append(el("li", "", g))); gaps.append(ul);
+      card.append(gaps);
+    }
+    return card;
+  },
+  clarify_request(e, run) {
+    const card = el("div", "card indent");
+    card.append(el("div", "label", "The agent asks you"), el("div", "", e.question));
+    const row = el("div", "row"), input = el("input"), send = el("button", "", "Send");
+    input.type = "text"; input.placeholder = "Your answer…";
+    const submit = async () => {
+      if (!input.value.trim()) return;
+      input.disabled = send.disabled = true;
+      await fetch(`/api/runs/${run.id}/clarify`, { method: "POST", headers: { "Content-Type": "application/json" },
+                                                    body: JSON.stringify({ answer: input.value }) });
+    };
+    send.onclick = submit;
+    input.onkeydown = (ev) => { if (ev.key === "Enter") submit(); };
+    row.append(input, send); card.append(row);
+    run.pending = row;
+    setTimeout(() => input.focus(), 0);
+    return card;
+  },
+  clarify_answer(e, run) {
+    if (run.pending) { run.pending.remove(); run.pending = null; }
+    const card = el("div", "card indent");
+    card.append(el("div", "label", "You answered"), el("div", "", e.answer));
+    return card;
+  },
+  draft(e) {
+    const card = el("div", "card indent"), details = el("details");
+    details.append(el("summary", "meta", `Draft answer (attempt ${e.attempt})`), el("div", "pre", e.answer));
+    card.append(details);
+    return card;
+  },
+  review(e) {
+    const card = el("div", "card indent");
+    card.append(el("div", "label", e.accept ? "Draft accepted" : "Draft rejected"),
+                el("p", "why" + (e.accept ? "" : " bad"), e.why));
+    return card;
+  },
+  error(e) {
+    const card = el("div", "card");
+    card.append(el("div", "label bad", "Error"), el("div", "bad", e.message));
+    return card;
+  },
+  final(e) {
+    const card = el("div", "card");
+    card.append(el("div", "label answer", "Final answer"), el("div", "pre", e.answer));
+    if (e.sources.length) card.append(el("div", "label", "Sources"), compactSourceList(e.sources));
+    card.append(el("div", "label", "Run metrics"));
+    const table = el("table");
+    for (const [key, name] of METRICS) {
+      const tr = el("tr"); tr.append(el("td", "meta", name), el("td", "", String(e.metrics[key] ?? "–"))); table.append(tr);
+    }
+    card.append(table);
+    return card;
+  },
+};
+
+async function startRun(question, mode) {
+  const col = el("section", "col"), status = el("div", "status", "Starting…"), timeline = el("div");
+  col.append(el("h2", "", TITLES[mode]), status, timeline);
+  $("cols").append(col);
+  active++;
+  try {
+    const res = await fetch("/api/runs", { method: "POST", headers: { "Content-Type": "application/json" },
+                                           body: JSON.stringify({ question, mode }) });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || res.statusText);
+    const run = { id: body.id, pending: null };
+    let seen = 0;
+    for (;;) {
+      const data = await (await fetch(`/api/runs/${run.id}?since=${seen}`)).json();
+      for (const e of data.events) { if (render[e.type]) timeline.append(render[e.type](e, run)); }
+      seen += data.events.length;
+      status.textContent = data.done ? "Finished" : run.pending ? "Waiting for your answer…" : "Working…";
+      if (data.done) break;
+      await new Promise((r) => setTimeout(r, 600));
+    }
+  } catch (err) {
+    status.textContent = "Failed";
+    timeline.append(render.error({ message: String(err.message || err) }));
+  } finally {
+    if (--active === 0) $("go").disabled = false;
+  }
+}
+
+$("form").addEventListener("submit", (ev) => {
+  ev.preventDefault();
+  const question = $("question").value.trim();
+  if (!question) return;
+  $("cols").replaceChildren();
+  $("go").disabled = true;
+  const mode = $("mode").value;
+  (mode === "both" ? ["jev", "baseline"] : [mode]).forEach((m) => startRun(question, m));
+});
+$("question").addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); $("form").requestSubmit(); }
+});
+
+fetch("/api/info").then((r) => r.json()).then((info) => {
+  const notes = [];
+  if (!info.jev_is_real) notes.push(`Jev backend: ${info.jev}. Decisions in Jev mode are not from the real model yet.`);
+  if (info.llm === "mock-llm") notes.push("Offline mode: the LLM and search are mocked.");
+  if (notes.length) { $("banner").textContent = notes.join(" "); $("banner").hidden = false; }
+});
+</script>
+</body>
+</html>
