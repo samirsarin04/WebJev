@@ -1,4 +1,5 @@
 """Offline tests (mock LLM, search and Jev).  Run:  python -m unittest discover tests"""
+import copy
 import os
 import sys
 import tempfile
@@ -9,9 +10,13 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from webjev import jev as J
+from webjev import tools
 from webjev.agent import AGENTS, MODES, Agent, DecisionLoopAgent, make_jev, run
 from webjev.config import Config
 from webjev.controllers import DECIDE_QUESTIONS, JevOrchestrator
+from webjev.llm import MockLLM
+from webjev.search import MockSearch
+from webjev.state import RunState
 
 
 def cfg(**kw):
@@ -87,6 +92,46 @@ class Agents(unittest.TestCase):
             os.environ["TYPESAFE_API_KEY"] = "test-key"
             self.assertIsInstance(make_jev(Config()), J.Jev)
             self.assertIsInstance(make_jev(Config(offline=True)), J.MockJev)
+
+
+class UnreadablePages(MockSearch):
+    def fetch(self, url, max_chars):
+        return None
+
+
+class Tools(unittest.TestCase):
+    def setUp(self):
+        self.cfg, self.llm, self.st = cfg(), MockLLM(), RunState(question="Do vaccines cause autism?")
+
+    def snap(self):
+        # snapshot() shares RunState's lists; copy it so the mock LLM writes the same query each time
+        return copy.deepcopy(self.st.snapshot(self.cfg))
+
+    def test_run_query_drops_known_urls_and_leaves_state_alone(self):
+        snap = self.snap()
+        first = tools.search(self.llm, MockSearch(), self.st, self.cfg, copy.deepcopy(snap))
+        q = tools.run_query(self.llm, MockSearch(), self.st, self.cfg, copy.deepcopy(snap))
+        known = {s["url"] for s in first.new_sources}
+        self.assertTrue(known)
+        self.assertTrue(known <= {r["url"] for r in q.results})   # same mock query, same URLs back
+        self.assertFalse(known & {r["url"] for r in q.new_results})
+        self.assertEqual(len(self.st.searches), 1)                # run_query recorded nothing
+
+    def test_read_pages_falls_back_to_snippet(self):
+        results = MockSearch().search("q", 2)
+        read = tools.read_pages(self.llm, UnreadablePages(), self.st, self.cfg, self.snap(), results)
+        self.assertEqual(read.pages_read, 0)
+        self.assertEqual([s.fetched for s in read.sources], [False, False])
+        self.assertEqual(len(self.st.sources), 2)
+
+    def test_search_with_no_new_results_records_a_gap(self):
+        self.cfg = cfg(results_per_search=2, pages_per_search=2)   # the first search reads every result
+        snap = self.snap()
+        tools.search(self.llm, MockSearch(), self.st, self.cfg, copy.deepcopy(snap))
+        again = tools.search(self.llm, MockSearch(), self.st, self.cfg, copy.deepcopy(snap))  # same query
+        self.assertEqual((again.pages_read, again.new_sources), (0, []))
+        self.assertEqual(self.st.searches[-1]["new_sources"], [])
+        self.assertIn("returned no new sources", self.st.gaps[-1])
 
 
 class FixedJev(J.JevBackend):
