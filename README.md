@@ -70,6 +70,7 @@ is the only variable.
 | File | Role |
 |---|---|
 | `webjev/agent.py` | the `Agent` interface and one subclass per mode (`AGENTS`), the shared loop, guardrails, metrics, run logging, and building the LLM / search / Jev backends |
+| `webjev/tools.py` | the loop's actions: search (query, search, read pages, digest) and clarify; each returns what happened |
 | `webjev/prompts.py` | every prompt the writer LLM sees: search queries, page digests, clarifying questions, answers |
 | `webjev/controllers.py` | the decision layer: baseline and Jev orchestrator |
 | `webjev/jev.py` | Jev client (`POST /v1/systemone`) and the offline mock |

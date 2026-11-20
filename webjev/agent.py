@@ -25,9 +25,10 @@ from .config import Config
 from .controllers import BaselineController, Controller, JevOrchestrator
 from .jev import Jev, JevBackend, MockJev
 from .llm import LLM, AnthropicLLM, MockLLM, OpenAILLM
-from .prompts import digest, write_answer, write_clarification, write_query
+from . import tools
+from .prompts import write_answer
 from .search import Search, make_search
-from .state import RunState, Source
+from .state import RunState
 
 
 # --- what an agent runs on ---------------------------------------------------------
@@ -72,18 +73,6 @@ def describe_backends(cfg: Config) -> dict:
 
 
 # --- which system runs -------------------------------------------------------------
-@dataclass
-class RunContext:
-    """Everything one run's loop works with. Built fresh per run, so agents hold no per-run state."""
-    cfg: Config
-    st: RunState
-    m: dict                                   # metrics, reported identically by every agent
-    emit: Callable[..., None]
-    ask_user: Callable[[str], str] | None
-    parts: Parts | None = None
-    controller: Controller | None = None      # what makes this run's decisions; its name goes in the record
-
-
 class Agent(ABC):
     """One research system. `run` is shared (setup, metrics, error handling, logging); `_loop` differs."""
     mode: str
@@ -109,16 +98,15 @@ class Agent(ABC):
             if on_event:
                 on_event(event)
 
-        ctx = RunContext(cfg=cfg, st=st, m=m, emit=emit, ask_user=ask_user)
-        final, error = None, None
+        parts, controller, final, error = None, None, None, None
         try:
-            ctx.parts = build_parts(cfg, self.uses_jev)
-            final = self._loop(ctx)
+            parts = build_parts(cfg, self.uses_jev)
+            controller = self.make_controller(parts)
+            final = self._loop(parts, controller, st, m, emit, ask_user)
         except Exception as exc:  # surface any backend failure in the trace instead of losing the run
             error = f"{type(exc).__name__}: {exc}"
             emit("error", message=error)
 
-        parts = ctx.parts
         wall = time.perf_counter() - t0
         m["time_to_answer_s"] = round(wall, 2)                     # wall clock, includes waiting on the user
         m["agent_time_s"] = round(wall - m["user_wait_s"], 2)      # excludes waiting on the user
@@ -129,7 +117,7 @@ class Agent(ABC):
                      llm_output_tokens=parts.llm.output_tokens, jev_calls=parts.jev.calls if parts.jev else 0)
         record = {
             "id": run_id, "question": question, "mode": self.mode,
-            "backends": {"controller": ctx.controller.name if ctx.controller else None, "llm": parts.llm.name,
+            "backends": {"controller": controller.name if controller else None, "llm": parts.llm.name,
                          "search": parts.search.name} if parts else {},
             "answer": final, "error": error, "metrics": m,
             "sources": [vars(s) for s in st.sources], "clarifications": st.clarifications,
@@ -142,20 +130,20 @@ class Agent(ABC):
         return record
 
     @abstractmethod
-    def _loop(self, ctx: RunContext) -> str | None:
-        """Research the question in `ctx` and return the final answer."""
+    def make_controller(self, parts: Parts) -> Controller:
+        """The decision layer this agent uses. Its name goes in the run record."""
+
+    @abstractmethod
+    def _loop(self, parts: Parts, controller: Controller, st: RunState, m: dict,
+              emit: Callable[..., None], ask_user: Callable[[str], str] | None) -> str | None:
+        """Research `st.question`, updating `st` and the metrics `m`, and return the final answer."""
 
 
 class DecisionLoopAgent(Agent):
     """The search / clarify / answer loop. The controller is the only variable between subclasses."""
 
-    @abstractmethod
-    def make_controller(self, parts: Parts) -> Controller:
-        """The decision layer this agent uses."""
-
-    def _loop(self, ctx: RunContext) -> str | None:
-        cfg, st, m, emit, ask_user, parts = ctx.cfg, ctx.st, ctx.m, ctx.emit, ctx.ask_user, ctx.parts
-        controller = ctx.controller = self.make_controller(parts)
+    def _loop(self, parts, controller, st, m, emit, ask_user):
+        cfg = self.cfg
         final, draft = None, None
         searches_since_draft, rejected = 0, False
         for step in range(1, cfg.max_steps + 1):
@@ -173,42 +161,22 @@ class DecisionLoopAgent(Agent):
                  details=decision.details, decider=decision.decider, latency_s=round(decision.latency_s, 3))
 
             if action == "search":
-                query = write_query(parts.llm, snap)
-                results = parts.search.search(query, cfg.results_per_search)
+                found = tools.search(parts.llm, parts.search, st, cfg, snap)
                 m["searches"] += 1
+                m["pages_visited"] += found.pages_read
                 searches_since_draft += 1
-                known = {s.url for s in st.sources}
-                pages = []
-                for r in [r for r in results if r["url"] not in known][:cfg.pages_per_search]:
-                    text = parts.search.fetch(r["url"], cfg.max_page_chars)
-                    if text:
-                        m["pages_visited"] += 1
-                    src = Source(id=len(st.sources) + 1, title=r["title"], url=r["url"], fetched=bool(text))
-                    st.sources.append(src)
-                    pages.append({"id": src.id, "title": src.title, "url": src.url, "text": text or r["snippet"]})
-                st.searches.append({"query": query, "new_sources": [p["id"] for p in pages]})
-                if pages:
-                    out = digest(parts.llm, snap, pages)
-                    by_id = {s.id: s for s in st.sources}
-                    for item in out["sources"]:
-                        if item["id"] in by_id:
-                            by_id[item["id"]].summary = item["summary"]
-                            by_id[item["id"]].relevant = item["relevant"]
-                    st.gaps = out["information_gaps"]
-                else:
-                    st.gaps.append(f"The search '{query}' returned no new sources.")
-                emit("search", step=step, query=query, results=len(results), gaps=st.gaps,
-                     sources=[vars(s) for s in st.sources if s.id in {p["id"] for p in pages}])
+                emit("search", step=step, query=found.query, results=found.n_results, gaps=st.gaps,
+                     sources=found.new_sources)
 
             elif action == "clarify":
-                ask = write_clarification(parts.llm, snap)
-                m["clarification_requests"] += 1
-                emit("clarify_request", step=step, question=ask)
-                waited = time.perf_counter()
-                reply = (ask_user(ask) or "").strip() or "(no response)"
-                m["user_wait_s"] += time.perf_counter() - waited
-                st.clarifications.append({"question": ask, "answer": reply})
-                emit("clarify_answer", step=step, answer=reply)
+                def asked(question: str, step=step):
+                    m["clarification_requests"] += 1
+                    emit("clarify_request", step=step, question=question)
+
+                got = tools.clarify(parts.llm, snap, ask_user, on_question=asked)
+                m["user_wait_s"] += got.waited_s
+                st.clarifications.append({"question": got.question, "answer": got.reply})
+                emit("clarify_answer", step=step, answer=got.reply)
 
             else:
                 draft = write_answer(parts.llm, snap, cfg.answer_style, rejected=draft if rejected else None)
