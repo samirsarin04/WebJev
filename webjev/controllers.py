@@ -3,9 +3,8 @@
   BaselineController - WebGPT-style: the LLM decides the next action and reviews its own draft.
   JevOrchestrator    - Jev decides (Choice + Score + Noul); the LLM only writes text.
 
-Later: "LLM as a tool for Jev". Add a controller here whose Choice criteria are explicit tools
-(e.g. search_new_query, refine_last_query, open_result_3, ask_user, answer) and have the agent loop
-dispatch on those; `Controller` is the seam, nothing else in the agent needs to know who decides.
+Both are used by DecisionLoopAgent (agent.py), which runs the same loop for each. "LLM as a tool for Jev"
+(Option 2) needs a different action set, so it is a new Agent subclass in agent.py, not a controller here.
 """
 from __future__ import annotations
 

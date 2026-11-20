@@ -1,6 +1,6 @@
 """LLM backends. The agent only needs two primitives: free text and schema-constrained JSON.
 
-`task` names the job (query, digest, clarify, answer, decide, review, judge, jev) so the mock can
+`task` names the job (query, digest, clarify, answer, decide, review, judge) so the mock can
 answer without a network; `meta` carries the structured inputs for the mock and is ignored otherwise.
 """
 from __future__ import annotations

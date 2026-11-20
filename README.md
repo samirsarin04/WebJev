@@ -18,7 +18,7 @@ copy .env.example .env      # then fill in the keys
 
 | Key | Needed for | Without it |
 |---|---|---|
-| `TYPESAFE_API_KEY` | the real Jev model | Jev mode runs on an LLM stand-in (same I/O shape, **not calibrated, not Jev**) |
+| `TYPESAFE_API_KEY` | Jev mode | Jev mode fails with a clear error; baseline mode and `--offline` (mock Jev) still work |
 | `OPENAI_API_KEY` | the writer LLM, baseline decisions, the eval judge (default model `gpt-5.6-sol`; change with `WEBJEV_LLM_MODEL`). `ANTHROPIC_API_KEY` works instead | only `--offline` works |
 | `SERPER_API_KEY` or `TAVILY_API_KEY` | web search (Serper = Google results; Serper is used if both are set) | DuckDuckGo scraping is tried; it was blocked on the dev machine and is unreliable in general |
 
@@ -69,9 +69,10 @@ is the only variable.
 
 | File | Role |
 |---|---|
-| `webjev/agent.py` | the loop, text-writing prompts, guardrails, metrics, run logging |
+| `webjev/agent.py` | the `Agent` interface and one subclass per mode (`AGENTS`), the shared loop, guardrails, metrics, run logging, and building the LLM / search / Jev backends |
+| `webjev/prompts.py` | every prompt the writer LLM sees: search queries, page digests, clarifying questions, answers |
 | `webjev/controllers.py` | the decision layer: baseline and Jev orchestrator |
-| `webjev/jev.py` | Jev client (`POST /v1/systemone`), the LLM stand-in, the mock |
+| `webjev/jev.py` | Jev client (`POST /v1/systemone`) and the offline mock |
 | `webjev/llm.py` | OpenAI and Anthropic clients, and the mock |
 | `webjev/search.py` | DuckDuckGo / Tavily search, page fetching |
 | `webjev/server.py`, `static/index.html` | the UI |
@@ -104,10 +105,13 @@ and writes `results.jsonl` and `summary.csv` under `runs/eval-<timestamp>/`. Re-
 
 ## Switching to "LLM as a tool for Jev"
 
-`Controller` in `webjev/controllers.py` is the seam. Add a controller whose Choice criteria are explicit
-tools (new query, refine last query, open result N, ask user, answer) and use a Score to rank which search
-results to open; then have the loop in `agent.py` dispatch on those tool names. State, logging, the UI and
-the eval harness don't change.
+`Agent` in `webjev/agent.py` is the seam. Each mode is an `Agent` subclass registered in `AGENTS`: the
+baseline (`BaselineAgent`) and Jev mode (`JevOrchestratorAgent`) share `DecisionLoopAgent`'s
+search / clarify / answer loop and differ only in their controller. Option 2 needs different actions, so it
+is a new `Agent` subclass with its own `_loop`: Choice criteria that are explicit tools (new query, refine
+last query, open result N, ask user, answer), a Score to rank which search results to open, and a loop that
+dispatches on those tool names. Add it to `AGENTS` and it becomes a mode. Run setup, metrics, logging, the UI
+and the eval harness come from `Agent.run` and don't change.
 
 ## Known limits
 

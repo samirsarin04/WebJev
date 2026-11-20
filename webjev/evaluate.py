@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import random
 import statistics
 import time
@@ -108,14 +109,14 @@ def main():
     args = ap.parse_args()
 
     cfg = Config.from_env(answer_style="concise", offline=True if args.offline else None)
+    if "jev" in args.modes and not cfg.offline and not os.environ.get("TYPESAFE_API_KEY"):
+        ap.error("Jev mode needs TYPESAFE_API_KEY (add it to .env), or drop it with --modes baseline.")
     out = Path(args.out or Path(cfg.runs_dir) / f"eval-{time.strftime('%Y%m%d-%H%M%S')}")
     out.mkdir(parents=True, exist_ok=True)
     cfg.runs_dir = str(out / "runs")
 
     backends = describe_backends(cfg)
     print(f"LLM: {backends['llm']} | search: {backends['search']} | Jev: {backends['jev']}")
-    if "jev" in args.modes and not backends["jev_is_real"]:
-        print("WARNING: Jev mode is using a stand-in, not the real Jev model. Do not report these numbers as Jev results.")
 
     items = load_truthfulqa()
     if args.n and args.n < len(items):

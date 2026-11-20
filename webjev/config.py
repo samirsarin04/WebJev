@@ -45,7 +45,6 @@ class Config:
     offline: bool = False              # use mock LLM / search / Jev (no network, no keys)
     llm_provider: str = "auto"         # auto | openai | anthropic  (auto: OpenAI if OPENAI_API_KEY is set)
     llm_model: str = ""                # empty = the provider's default below
-    jev_backend: str = "auto"          # auto | http | llm | mock
     jev_model: str = "jev-latest"      # pin (e.g. jev-1.13.0) once thresholds are tuned
     jev_url: str = "https://api.typesafe.ai/v1/systemone"
     search_backend: str = "auto"       # auto | serper | tavily | ddg | mock
@@ -74,7 +73,6 @@ class Config:
             offline=_env("WEBJEV_OFFLINE", False, bool),
             llm_provider=_env("WEBJEV_LLM_PROVIDER", cls.llm_provider),
             llm_model=_env("WEBJEV_LLM_MODEL", cls.llm_model),
-            jev_backend=_env("WEBJEV_JEV_BACKEND", cls.jev_backend),
             jev_model=_env("TYPESAFE_DEFAULT_MODEL", cls.jev_model),
             jev_url=_env("WEBJEV_JEV_URL", cls.jev_url),
             search_backend=_env("WEBJEV_SEARCH_BACKEND", cls.search_backend),

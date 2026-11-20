@@ -5,20 +5,18 @@ Wire format (docs.typesafe.ai): POST {state, model, questions} -> {model, answer
   score  -> {score, legend, probabilities, confidence}   (score = probability-weighted mean level)
   noul   -> {noul}                                       (0-1 probability of "yes", no confidence)
 
-Three interchangeable backends return answers in that same format:
-  JevHTTP  - the real API (needs TYPESAFE_API_KEY)
-  LLMJev   - an LLM emulating Jev's I/O. NOT calibrated; a stand-in until the key arrives.
-  MockJev  - deterministic heuristics for offline tests.
+Two backends return answers in that same format:
+  Jev      - the real API (needs TYPESAFE_API_KEY)
+  MockJev  - deterministic heuristics for offline tests and demos (--offline / WEBJEV_OFFLINE=1)
 """
 from __future__ import annotations
 
-import json
 import os
 import time
 
 import requests
 
-from .llm import LLM, mock_policy
+from .llm import mock_policy
 
 
 class JevError(RuntimeError):
@@ -62,7 +60,7 @@ def normalized_score(answer: dict) -> float:
 
 
 def _wire_answers(questions: dict, raw: dict) -> dict:
-    """Turn raw per-option weights into Jev's answer format (used by the stand-in backends)."""
+    """Turn raw per-option weights into Jev's answer format (used by MockJev)."""
     answers = {}
     for qid, q in questions.items():
         value = raw[qid]
@@ -92,7 +90,7 @@ class JevBackend:
         raise NotImplementedError
 
 
-class JevHTTP(JevBackend):
+class Jev(JevBackend):
     def __init__(self, url: str, model: str, api_key: str | None = None):
         super().__init__()
         self.url, self.model = url, model
@@ -132,36 +130,6 @@ class JevHTTP(JevBackend):
                 raise JevError(f"Jev response is missing answers for {missing}: {str(body)[:300]}")
             return body["answers"]
         raise JevError("unreachable")
-
-
-class LLMJev(JevBackend):
-    """Stand-in: an LLM constrained to Jev's question types. Its probabilities are NOT calibrated."""
-
-    def __init__(self, llm: LLM):
-        super().__init__()
-        self.llm = llm
-        self.name = f"llm-standin({llm.name})"
-
-    def ask(self, state, questions):
-        props = {}
-        for qid, q in questions.items():
-            if q["type"] == "noul":
-                props[qid] = {"type": "number"}
-                continue
-            keys = list(q["criteria"]) if q["type"] == "choice" else [str(i) for i in range(len(q["criteria"]))]
-            props[qid] = {"type": "object", "properties": {k: {"type": "number"} for k in keys},
-                          "required": keys, "additionalProperties": False}
-        schema = {"type": "object", "properties": props, "required": list(props), "additionalProperties": False}
-        system = (
-            "You emulate a structured decision model. Evaluate each question independently against the "
-            "state. For a choice question give a probability (0-1) for every option; for a score question "
-            "give a probability for every level index (levels are listed in order, 0 = first); for a noul "
-            "question give the probability (0-1) that the statement is true. Be calibrated."
-        )
-        prompt = f"STATE:\n{json.dumps(state, ensure_ascii=False, indent=1)}\n\nQUESTIONS:\n{json.dumps(questions, indent=1)}"
-        raw = self.llm.json("jev", system, prompt, schema, effort="low")
-        self.calls += 1
-        return _wire_answers(questions, raw)
 
 
 class MockJev(JevBackend):

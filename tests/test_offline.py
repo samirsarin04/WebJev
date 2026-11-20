@@ -1,13 +1,15 @@
 """Offline tests (mock LLM, search and Jev).  Run:  python -m unittest discover tests"""
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from webjev import jev as J
-from webjev.agent import run
+from webjev.agent import AGENTS, MODES, Agent, DecisionLoopAgent, make_jev, run
 from webjev.config import Config
 from webjev.controllers import DECIDE_QUESTIONS, JevOrchestrator
 
@@ -48,6 +50,43 @@ class AgentLoop(unittest.TestCase):
         rec = run("What is the best laptop?", "baseline", cfg(max_searches=1, max_steps=6))
         self.assertEqual(rec["metrics"]["searches"], 1)
         self.assertTrue(rec["answer"])
+
+
+class Agents(unittest.TestCase):
+    def test_registry_maps_modes_to_decision_loop_agents(self):
+        self.assertEqual(MODES, ("jev", "baseline"))
+        for mode, agent in AGENTS.items():
+            self.assertEqual(agent.mode, mode)
+            self.assertTrue(issubclass(agent, DecisionLoopAgent))
+        self.assertEqual(AGENTS["jev"].uses_jev, True)
+        self.assertEqual(AGENTS["baseline"].uses_jev, False)
+
+    def test_interfaces_are_abstract(self):
+        for abstract in (Agent, DecisionLoopAgent):
+            with self.assertRaises(TypeError):
+                abstract(cfg())
+
+    def test_unknown_mode_raises(self):
+        with self.assertRaises(ValueError):
+            run("q", "nonexistent", cfg())
+
+    def test_backend_failure_is_recorded_not_raised(self):
+        env = {k: v for k, v in os.environ.items() if k not in ("OPENAI_API_KEY", "SERPER_API_KEY")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            rec = run("q", "jev", Config(search_backend="serper", runs_dir=tempfile.mkdtemp()))
+        self.assertIsNotNone(rec["error"])
+        self.assertIsNone(rec["answer"])
+        self.assertEqual(rec["backends"], {})
+
+    def test_jev_is_real_or_mock_with_no_fallback(self):
+        env = {k: v for k, v in os.environ.items() if k != "TYPESAFE_API_KEY"}
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertIsInstance(make_jev(Config(offline=True)), J.MockJev)
+            with self.assertRaises(J.JevError):      # no key: fail, never silently substitute
+                make_jev(Config())
+            os.environ["TYPESAFE_API_KEY"] = "test-key"
+            self.assertIsInstance(make_jev(Config()), J.Jev)
+            self.assertIsInstance(make_jev(Config(offline=True)), J.MockJev)
 
 
 class FixedJev(J.JevBackend):

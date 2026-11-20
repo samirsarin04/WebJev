@@ -1,8 +1,14 @@
-"""The research agent loop. Identical for both modes; only `parts.controller` differs.
+"""The research agents.
 
-Each step: controller decides -> guardrails -> execute (search / clarify / answer).
-The LLM writes all text (queries, source digests, clarifying questions, answers); it makes no
-control-flow decisions in Jev mode.
+Two independent axes:
+  which system runs  - an `Agent` subclass, registered in AGENTS and selected by mode name.
+  what it runs on    - `Parts`: one LLM, one Search and (if the agent needs it) one Jev backend, each real
+                       or mock, built from the config by `build_parts`.
+
+BaselineAgent and JevOrchestratorAgent share DecisionLoopAgent's loop, so the controller is the only thing
+that differs between them. The LLM writes all text (prompts.py); in Jev mode it makes no control-flow
+decisions. A new system (e.g. Option 2, "LLM as a tool for Jev") is a new Agent subclass with its own
+`_loop`, plus one entry in AGENTS.
 """
 from __future__ import annotations
 
@@ -10,25 +16,25 @@ import json
 import os
 import time
 import uuid
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from .config import Config
 from .controllers import BaselineController, Controller, JevOrchestrator
-from .jev import JevBackend, JevHTTP, LLMJev, MockJev
+from .jev import Jev, JevBackend, MockJev
 from .llm import LLM, AnthropicLLM, MockLLM, OpenAILLM
+from .prompts import digest, write_answer, write_clarification, write_query
 from .search import Search, make_search
 from .state import RunState, Source
 
-MODES = ("jev", "baseline")
 
-
+# --- what an agent runs on ---------------------------------------------------------
 @dataclass
 class Parts:
     llm: LLM
     search: Search
-    controller: Controller
     jev: JevBackend | None = None
 
 
@@ -40,24 +46,13 @@ def make_llm(cfg: Config) -> LLM:
 
 
 def make_jev(cfg: Config) -> JevBackend:
-    backend = "mock" if cfg.offline else cfg.jev_backend
-    if backend == "auto":
-        backend = "http" if os.environ.get("TYPESAFE_API_KEY") else "llm"
-    if backend == "http":
-        return JevHTTP(cfg.jev_url, cfg.jev_model)
-    if backend == "llm":
-        return LLMJev(make_llm(cfg))   # separate instance: its tokens are not counted as writer-LLM usage
-    return MockJev()
+    """The real Jev API, or the mock when offline. Raises JevError if TYPESAFE_API_KEY is not set."""
+    return MockJev() if cfg.offline else Jev(cfg.jev_url, cfg.jev_model)
 
 
-def build(cfg: Config, mode: str) -> Parts:
-    if mode not in MODES:
-        raise ValueError(f"mode must be one of {MODES}")
+def build_parts(cfg: Config, needs_jev: bool) -> Parts:
     llm, search = make_llm(cfg), make_search(cfg)
-    if mode == "baseline":
-        return Parts(llm, search, BaselineController(llm))
-    jev = make_jev(cfg)
-    return Parts(llm, search, JevOrchestrator(jev, cfg.min_answer_confidence, cfg.review_threshold), jev)
+    return Parts(llm, search, make_jev(cfg) if needs_jev else None)
 
 
 def describe_backends(cfg: Config) -> dict:
@@ -67,127 +62,106 @@ def describe_backends(cfg: Config) -> dict:
         info["search"] = make_search(cfg).name
     except Exception as exc:
         info["search"] = f"unavailable ({exc})"
-    backend = "mock" if cfg.offline else cfg.jev_backend
-    if backend == "auto":
-        backend = "http" if os.environ.get("TYPESAFE_API_KEY") else "llm"
-    info["jev"] = {"http": f"Jev API ({cfg.jev_model})", "llm": "LLM stand-in (no TYPESAFE_API_KEY)",
-                   "mock": "mock-jev"}[backend]
-    info["jev_is_real"] = backend == "http"
+    if cfg.offline:
+        info["jev"] = "mock-jev"
+    else:
+        info["jev"] = f"Jev API ({cfg.jev_model})"
+        if not os.environ.get("TYPESAFE_API_KEY"):
+            info["jev"] += ", TYPESAFE_API_KEY not set: Jev mode will fail"
     return info
 
 
-# --- text generation (the LLM's whole job) ---------------------------------------
-def _ctx(snapshot: dict) -> str:
-    return json.dumps(snapshot, ensure_ascii=False, indent=1)
+# --- which system runs -------------------------------------------------------------
+@dataclass
+class RunContext:
+    """Everything one run's loop works with. Built fresh per run, so agents hold no per-run state."""
+    cfg: Config
+    st: RunState
+    m: dict                                   # metrics, reported identically by every agent
+    emit: Callable[..., None]
+    ask_user: Callable[[str], str] | None
+    parts: Parts | None = None
+    controller: Controller | None = None      # what makes this run's decisions; its name goes in the record
 
 
-def write_query(llm: LLM, snap: dict) -> str:
-    system = ("You write web search queries for a research agent. Given the agent's state, write the single "
-              "search query most likely to close its information gaps. Do not repeat a query from "
-              "search_history. Reply with the query only.")
-    query = llm.text("query", system, _ctx(snap), meta=snap)
-    return query.strip().splitlines()[0].strip().strip('"')[:300]
+class Agent(ABC):
+    """One research system. `run` is shared (setup, metrics, error handling, logging); `_loop` differs."""
+    mode: str
+    uses_jev: bool = False
+
+    def __init__(self, cfg: Config | None = None):
+        self.cfg = cfg or Config.from_env()
+
+    def run(self, question: str, ask_user: Callable[[str], str] | None = None,
+            on_event: Callable[[dict], None] | None = None, save: bool = True) -> dict:
+        """Run one question. `ask_user(question) -> answer` enables clarification requests."""
+        cfg = self.cfg
+        run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
+        st = RunState(question=question)
+        events: list[dict] = []
+        t0 = time.perf_counter()
+        m = dict(searches=0, pages_visited=0, search_answer_cycles=0, clarification_requests=0,
+                 answer_attempts=0, steps=0, decision_time_s=0.0, user_wait_s=0.0)
+
+        def emit(type_: str, **data):
+            event = {"type": type_, "t": round(time.perf_counter() - t0, 2), **data}
+            events.append(event)
+            if on_event:
+                on_event(event)
+
+        ctx = RunContext(cfg=cfg, st=st, m=m, emit=emit, ask_user=ask_user)
+        final, error = None, None
+        try:
+            ctx.parts = build_parts(cfg, self.uses_jev)
+            final = self._loop(ctx)
+        except Exception as exc:  # surface any backend failure in the trace instead of losing the run
+            error = f"{type(exc).__name__}: {exc}"
+            emit("error", message=error)
+
+        parts = ctx.parts
+        wall = time.perf_counter() - t0
+        m["time_to_answer_s"] = round(wall, 2)                     # wall clock, includes waiting on the user
+        m["agent_time_s"] = round(wall - m["user_wait_s"], 2)      # excludes waiting on the user
+        m["decision_time_s"] = round(m["decision_time_s"], 3)
+        m["user_wait_s"] = round(m["user_wait_s"], 2)
+        if parts:
+            m.update(llm_calls=parts.llm.calls, llm_input_tokens=parts.llm.input_tokens,
+                     llm_output_tokens=parts.llm.output_tokens, jev_calls=parts.jev.calls if parts.jev else 0)
+        record = {
+            "id": run_id, "question": question, "mode": self.mode,
+            "backends": {"controller": ctx.controller.name if ctx.controller else None, "llm": parts.llm.name,
+                         "search": parts.search.name} if parts else {},
+            "answer": final, "error": error, "metrics": m,
+            "sources": [vars(s) for s in st.sources], "clarifications": st.clarifications,
+            "events": events, "config": cfg.public(),
+        }
+        if final is not None:
+            emit("final", answer=final, sources=record["sources"], metrics=m, backends=record["backends"])
+        if save:
+            save_run(record, cfg)
+        return record
+
+    @abstractmethod
+    def _loop(self, ctx: RunContext) -> str | None:
+        """Research the question in `ctx` and return the final answer."""
 
 
-DIGEST_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "sources": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {"id": {"type": "integer"}, "relevant": {"type": "boolean"},
-                               "summary": {"type": "string"}},
-                "required": ["id", "relevant", "summary"],
-                "additionalProperties": False,
-            },
-        },
-        "information_gaps": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["sources", "information_gaps"],
-    "additionalProperties": False,
-}
+class DecisionLoopAgent(Agent):
+    """The search / clarify / answer loop. The controller is the only variable between subclasses."""
 
+    @abstractmethod
+    def make_controller(self, parts: Parts) -> Controller:
+        """The decision layer this agent uses."""
 
-def digest(llm: LLM, snap: dict, pages: list[dict]) -> dict:
-    system = ("You read web pages for a research agent. For each NEW page, write a 2-4 sentence summary of "
-              "what it says that bears on the user's question (state facts, figures and who claims them; "
-              "note if the page is low-quality or contradicts another source) and mark whether it is "
-              "relevant. Then list what is still unknown or unverified for answering the question as short "
-              "information gaps, taking the earlier sources into account. Use an empty list if nothing is missing.")
-    blocks = "\n\n".join(f"[{p['id']}] {p['title']}\n{p['url']}\n{p['text']}" for p in pages)
-    prompt = f"AGENT STATE:\n{_ctx(snap)}\n\nNEW PAGES:\n{blocks}"
-    return llm.json("digest", system, prompt, DIGEST_SCHEMA, meta={**snap, "pages": pages})
-
-
-def write_clarification(llm: LLM, snap: dict) -> str:
-    system = ("You write clarifying questions for a research agent. The agent has decided it cannot answer "
-              "well without asking the user. Write one short, specific question that resolves the most "
-              "important ambiguity. Do not repeat a question from clarifications. Reply with the question only.")
-    return llm.text("clarify", system, _ctx(snap), meta=snap).strip()
-
-
-def write_answer(llm: LLM, snap: dict, style: str, rejected: str | None = None) -> str:
-    length = ("Answer in one to three sentences." if style == "concise"
-              else "Answer directly first, then give the supporting detail a careful reader needs.")
-    system = (
-        "You write the final answer for a web research agent. Base factual claims on the listed sources and "
-        "cite them inline as [id], using only ids that appear in sources. If the sources conflict, say so. "
-        "If they do not support an answer, say what is and is not known rather than guessing. If the question "
-        "rests on a false premise or a common misconception, say so plainly. " + length
-    )
-    prompt = _ctx(snap)
-    if rejected:
-        prompt += f"\n\nAn earlier draft was rejected as not fully supported or not responsive:\n{rejected}"
-    return llm.text("answer", system, prompt, effort="medium", meta=snap)
-
-
-# --- the loop --------------------------------------------------------------------
-def _guard(action: str, st: RunState, cfg: Config, step: int, can_ask: bool, need_new_evidence: bool):
-    """Budget guardrails, applied identically in both modes. Returns (action, reason-if-overridden)."""
-    can_search = len(st.searches) < cfg.max_searches
-    if step >= cfg.max_steps and action != "answer":
-        return "answer", "Step budget exhausted, so the agent answers with what it has."
-    if action == "search" and not can_search:
-        return "answer", "Search budget exhausted, so the agent answers with what it has."
-    if action == "clarify" and (not can_ask or len(st.clarifications) >= cfg.max_clarifications):
-        why = "No user is available to ask" if not can_ask else "Clarification budget exhausted"
-        return ("search", f"{why}, so the agent searches instead.") if can_search else \
-               ("answer", f"{why} and no searches remain, so the agent answers.")
-    if action == "answer" and can_search and step < cfg.max_steps:
-        if cfg.require_search and not st.searches:
-            return "search", "Answers must cite sources, so the agent searches at least once first."
-        if need_new_evidence:
-            return "search", "The last draft was rejected, so the agent gathers new evidence before redrafting."
-    return action, None
-
-
-def run(question: str, mode: str = "jev", cfg: Config | None = None,
-        ask_user: Callable[[str], str] | None = None,
-        on_event: Callable[[dict], None] | None = None, save: bool = True) -> dict:
-    """Run one question. `ask_user(question) -> answer` enables clarification requests."""
-    cfg = cfg or Config.from_env()
-    run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
-    st = RunState(question=question)
-    events: list[dict] = []
-    t0 = time.perf_counter()
-    m = dict(searches=0, pages_visited=0, search_answer_cycles=0, clarification_requests=0,
-             answer_attempts=0, steps=0, decision_time_s=0.0, user_wait_s=0.0)
-
-    def emit(type_: str, **data):
-        event = {"type": type_, "t": round(time.perf_counter() - t0, 2), **data}
-        events.append(event)
-        if on_event:
-            on_event(event)
-
-    parts, final, draft, error = None, None, None, None
-    searches_since_draft, rejected = 0, False
-    try:
-        parts = build(cfg, mode)
+    def _loop(self, ctx: RunContext) -> str | None:
+        cfg, st, m, emit, ask_user, parts = ctx.cfg, ctx.st, ctx.m, ctx.emit, ctx.ask_user, ctx.parts
+        controller = ctx.controller = self.make_controller(parts)
+        final, draft = None, None
+        searches_since_draft, rejected = 0, False
         for step in range(1, cfg.max_steps + 1):
             m["steps"] = step
             snap = st.snapshot(cfg)
-            decision = parts.controller.decide(snap)
+            decision = controller.decide(snap)
             m["decision_time_s"] += decision.latency_s
             action, override = _guard(decision.action, st, cfg, step, ask_user is not None,
                                       need_new_evidence=rejected and searches_since_draft == 0)
@@ -246,7 +220,7 @@ def run(question: str, mode: str = "jev", cfg: Config | None = None,
                 can_retry = (m["answer_attempts"] < cfg.max_answer_attempts and step < cfg.max_steps
                              and len(st.searches) < cfg.max_searches)
                 if can_retry:
-                    review = parts.controller.review(st.snapshot(cfg), draft)
+                    review = controller.review(st.snapshot(cfg), draft)
                     m["decision_time_s"] += review.latency_s
                     emit("review", step=step, accept=review.accept, why=review.rationale,
                          details=review.details, latency_s=round(review.latency_s, 3))
@@ -259,31 +233,57 @@ def run(question: str, mode: str = "jev", cfg: Config | None = None,
                 break
         if final is None:
             final = draft or write_answer(parts.llm, st.snapshot(cfg), cfg.answer_style)
-    except Exception as exc:  # surface any backend failure in the trace instead of losing the run
-        error = f"{type(exc).__name__}: {exc}"
-        emit("error", message=error)
+        return final
 
-    wall = time.perf_counter() - t0
-    m["time_to_answer_s"] = round(wall, 2)                     # wall clock, includes waiting on the user
-    m["agent_time_s"] = round(wall - m["user_wait_s"], 2)      # excludes waiting on the user
-    m["decision_time_s"] = round(m["decision_time_s"], 3)
-    m["user_wait_s"] = round(m["user_wait_s"], 2)
-    if parts:
-        m.update(llm_calls=parts.llm.calls, llm_input_tokens=parts.llm.input_tokens,
-                 llm_output_tokens=parts.llm.output_tokens, jev_calls=parts.jev.calls if parts.jev else 0)
-    record = {
-        "id": run_id, "question": question, "mode": mode,
-        "backends": {"controller": parts.controller.name, "llm": parts.llm.name,
-                     "search": parts.search.name} if parts else {},
-        "answer": final, "error": error, "metrics": m,
-        "sources": [vars(s) for s in st.sources], "clarifications": st.clarifications,
-        "events": events, "config": cfg.public(),
-    }
-    if final is not None:
-        emit("final", answer=final, sources=record["sources"], metrics=m, backends=record["backends"])
-    if save:
-        save_run(record, cfg)
-    return record
+
+class BaselineAgent(DecisionLoopAgent):
+    """WebGPT-style: the LLM decides every action and reviews its own draft."""
+    mode = "baseline"
+
+    def make_controller(self, parts: Parts) -> Controller:
+        return BaselineController(parts.llm)
+
+
+class JevOrchestratorAgent(DecisionLoopAgent):
+    """Option 1: Jev decides each action and reviews the draft; the LLM only writes text."""
+    mode = "jev"
+    uses_jev = True
+
+    def make_controller(self, parts: Parts) -> Controller:
+        return JevOrchestrator(parts.jev, self.cfg.min_answer_confidence, self.cfg.review_threshold)
+
+
+AGENTS: dict[str, type[Agent]] = {a.mode: a for a in (JevOrchestratorAgent, BaselineAgent)}
+MODES = tuple(AGENTS)
+
+
+def run(question: str, mode: str = "jev", cfg: Config | None = None,
+        ask_user: Callable[[str], str] | None = None,
+        on_event: Callable[[dict], None] | None = None, save: bool = True) -> dict:
+    """Run one question with the agent registered for `mode`."""
+    if mode not in AGENTS:
+        raise ValueError(f"mode must be one of {MODES}")
+    return AGENTS[mode](cfg).run(question, ask_user=ask_user, on_event=on_event, save=save)
+
+
+# --- shared by the agents ----------------------------------------------------------
+def _guard(action: str, st: RunState, cfg: Config, step: int, can_ask: bool, need_new_evidence: bool):
+    """Budget guardrails, applied identically in both modes. Returns (action, reason-if-overridden)."""
+    can_search = len(st.searches) < cfg.max_searches
+    if step >= cfg.max_steps and action != "answer":
+        return "answer", "Step budget exhausted, so the agent answers with what it has."
+    if action == "search" and not can_search:
+        return "answer", "Search budget exhausted, so the agent answers with what it has."
+    if action == "clarify" and (not can_ask or len(st.clarifications) >= cfg.max_clarifications):
+        why = "No user is available to ask" if not can_ask else "Clarification budget exhausted"
+        return ("search", f"{why}, so the agent searches instead.") if can_search else \
+               ("answer", f"{why} and no searches remain, so the agent answers.")
+    if action == "answer" and can_search and step < cfg.max_steps:
+        if cfg.require_search and not st.searches:
+            return "search", "Answers must cite sources, so the agent searches at least once first."
+        if need_new_evidence:
+            return "search", "The last draft was rejected, so the agent gathers new evidence before redrafting."
+    return action, None
 
 
 def save_run(record: dict, cfg: Config) -> None:

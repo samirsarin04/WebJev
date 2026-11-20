@@ -238,8 +238,8 @@ $("question").addEventListener("keydown", (ev) => {
 
 fetch("/api/info").then((r) => r.json()).then((info) => {
   const notes = [];
-  if (!info.jev_is_real) notes.push(`Jev backend: ${info.jev}. Decisions in Jev mode are not from the real model yet.`);
-  if (info.llm === "mock-llm") notes.push("Offline mode: the LLM and search are mocked.");
+  if (info.llm === "mock-llm") notes.push("Offline mode: the LLM, search and Jev are mocked.");
+  else if (info.jev.includes("not set")) notes.push(`Jev backend: ${info.jev}.`);
   if (notes.length) { $("banner").textContent = notes.join(" "); $("banner").hidden = false; }
 });
 </script>
