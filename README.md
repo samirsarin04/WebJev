@@ -20,7 +20,7 @@ copy .env.example .env      # then fill in the keys
 |---|---|---|
 | `TYPESAFE_API_KEY` | Jev mode | Jev mode fails with a clear error; baseline mode and `--offline` (mock Jev) still work |
 | `OPENAI_API_KEY` | the writer LLM, baseline decisions, the eval judge (default model `gpt-5.6-sol`; change with `WEBJEV_LLM_MODEL`). `ANTHROPIC_API_KEY` works instead | only `--offline` works |
-| `SERPER_API_KEY` or `TAVILY_API_KEY` | web search (Serper = Google results; Serper is used if both are set) | DuckDuckGo scraping is tried; it was blocked on the dev machine and is unreliable in general |
+| `SERPER_API_KEY` | web search (Google results via serper.dev) | DuckDuckGo scraping is tried; it was blocked on the dev machine and is unreliable in general |
 
 ## Run
 
@@ -74,7 +74,7 @@ is the only variable.
 | `webjev/controllers.py` | the decision layer: baseline and Jev orchestrator |
 | `webjev/jev.py` | Jev client (`POST /v1/systemone`) and the offline mock |
 | `webjev/llm.py` | OpenAI and Anthropic clients, and the mock |
-| `webjev/search.py` | DuckDuckGo / Tavily search, page fetching |
+| `webjev/search.py` | Serper / DuckDuckGo search, page fetching |
 | `webjev/server.py`, `static/index.html` | the UI |
 | `webjev/evaluate.py` | TruthfulQA harness |
 
@@ -116,6 +116,5 @@ and the eval harness come from `Agent.run` and don't change.
 ## Known limits
 
 - The Jev client follows the public docs but has not been run against the live API yet (no key).
-- The Tavily backend is also untested for the same reason.
 - Pages are read as plain HTML text, cut to 8,000 characters; PDFs and JavaScript-only pages fall back to
   the search snippet.

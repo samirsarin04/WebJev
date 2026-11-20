@@ -60,30 +60,9 @@ class DDGSearch(Search):
             # failure rather than silently burning the agent's search budget.
             raise SearchError(
                 f"DuckDuckGo search failed ({exc}). It often blocks automated requests; "
-                "set TAVILY_API_KEY in .env for a reliable search backend."
+                "set SERPER_API_KEY in .env for a reliable search backend."
             ) from exc
         return [{"title": h.get("title", ""), "url": h.get("href", ""), "snippet": h.get("body", "")} for h in hits]
-
-
-class TavilySearch(Search):
-    name = "tavily"
-
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-
-    def _raw(self, query, k):
-        try:
-            resp = requests.post(
-                "https://api.tavily.com/search",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={"query": query, "max_results": k},
-                timeout=30,
-            )
-            resp.raise_for_status()
-        except requests.RequestException as exc:
-            raise SearchError(f"Tavily search failed: {exc}") from exc
-        return [{"title": h.get("title", ""), "url": h.get("url", ""), "snippet": h.get("content", "")}
-                for h in resp.json().get("results", [])]
 
 
 class SerperSearch(Search):
@@ -125,18 +104,13 @@ class MockSearch(Search):
 
 def make_search(cfg) -> Search:
     backend = "mock" if cfg.offline else cfg.search_backend
-    tavily_key = os.environ.get("TAVILY_API_KEY")
     serper_key = os.environ.get("SERPER_API_KEY")
     if backend == "auto":
-        backend = "serper" if serper_key else "tavily" if tavily_key else "ddg"
+        backend = "serper" if serper_key else "ddg"
     if backend == "mock":
         return MockSearch()
     if backend == "serper":
         if not serper_key:
             raise SearchError("SERPER_API_KEY is not set (add it to .env).")
         return SerperSearch(serper_key)
-    if backend == "tavily":
-        if not tavily_key:
-            raise SearchError("TAVILY_API_KEY is not set (add it to .env).")
-        return TavilySearch(tavily_key)
     return DDGSearch()

@@ -47,7 +47,7 @@ class Config:
     llm_model: str = ""                # empty = the provider's default below
     jev_model: str = "jev-latest"      # pin (e.g. jev-1.13.0) once thresholds are tuned
     jev_url: str = "https://api.typesafe.ai/v1/systemone"
-    search_backend: str = "auto"       # auto | serper | tavily | ddg | mock
+    search_backend: str = "auto"       # auto | serper | ddg | mock  (auto: Serper if SERPER_API_KEY is set)
 
     # --- agent budgets (identical in both modes, so only the decider differs) ---
     max_steps: int = 8
